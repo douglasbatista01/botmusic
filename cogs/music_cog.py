@@ -121,7 +121,7 @@ class GuildState:
         except (discord.NotFound, discord.HTTPException) as e:
             logger.warning(f"Não foi possível editar a mensagem do menu: {e}"); self.menu_message = None
 
-# --- Views Paginadas para o Menu Admin ---
+# --- [NOVO] Views Paginadas para o Menu Admin ---
 class AdminQueuePaginator(ui.View):
     def __init__(self, author: discord.Member, state: GuildState, cog: 'MusicCog'):
         super().__init__(timeout=180)
@@ -135,6 +135,23 @@ class AdminQueuePaginator(ui.View):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("Você não pode usar este menu.", ephemeral=True); return False
         return True
+    
+    def _get_page_embed(self) -> discord.Embed:
+        embed = discord.Embed(title=f"Admin: Pular Fila (Página {self.page + 1}/{self.total_pages + 1})", color=discord.Color.blurple())
+        start_index = self.page * ADMIN_QUEUE_ITEMS_PER_PAGE
+        end_index = start_index + ADMIN_QUEUE_ITEMS_PER_PAGE
+        page_songs = self.queue_list[start_index:end_index]
+
+        if not page_songs:
+            embed.description = "Não há mais músicas para exibir nesta página."
+        else:
+            desc = ""
+            for i, song in enumerate(page_songs):
+                desc += f"`{i + 1 + start_index}.` {song.title[:80]}\n"
+            embed.description = desc
+        
+        embed.set_footer(text="Clique em um botão para mover a música para o topo e tocá-la em seguida.")
+        return embed
 
     def update_view(self):
         self.clear_items()
@@ -142,11 +159,10 @@ class AdminQueuePaginator(ui.View):
         end_index = start_index + ADMIN_QUEUE_ITEMS_PER_PAGE
         page_songs = self.queue_list[start_index:end_index]
         
-        options = [discord.SelectOption(label=f"#{i + 1 + start_index}: {song.title[:80]}", value=str(i + start_index)) for i, song in enumerate(page_songs)]
-        if options:
-            select = ui.Select(placeholder=f"Página {self.page + 1}/{self.total_pages + 1} - Selecione uma música...", options=options)
-            select.callback = self.select_callback
-            self.add_item(select)
+        for i, song in enumerate(page_songs):
+            button = ui.Button(label=f"#{i + 1 + start_index}", style=discord.ButtonStyle.secondary, custom_id=f"select_{i + start_index}")
+            button.callback = self.select_callback
+            self.add_item(button)
         
         prev_button = ui.Button(label="Anterior", emoji="◀️", disabled=self.page == 0, row=1)
         prev_button.callback = self.prev_page_callback
@@ -158,34 +174,32 @@ class AdminQueuePaginator(ui.View):
 
     async def select_callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        selected_index = int(interaction.data['values'][0])
+        selected_index = int(interaction.data['custom_id'].split('_')[1])
         
-        song_to_move = self.queue_list.pop(selected_index)
+        # Usa a deque interna para manipulação atômica e eficiente
+        queue_deque = self.state.song_queue._queue
+        song_to_move = queue_deque[selected_index]
         
-        while not self.state.song_queue.empty():
-            try: self.state.song_queue.get_nowait()
-            except asyncio.QueueEmpty: continue
-            
-        await self.state.song_queue.put(song_to_move)
-        for song in self.queue_list: await self.state.song_queue.put(song)
-        
+        del queue_deque[selected_index]
+        queue_deque.insert(0, song_to_move)
+
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop() # Força o player a pegar a próxima música da fila
+            vc.stop()
             
-        await interaction.followup.send(f"✅ **{song_to_move.title}** foi movida para o topo e será a próxima a tocar.", ephemeral=True, delete_after=10)
+        await interaction.followup.send(f"✅ **{song_to_move.title}** será a próxima a tocar.", ephemeral=True, delete_after=10)
         await interaction.message.delete()
         await self.state.update_menu()
 
     async def prev_page_callback(self, interaction: discord.Interaction):
         self.page -= 1
         self.update_view()
-        await interaction.response.edit_message(view=self)
+        await interaction.response.edit_message(embed=self._get_page_embed(), view=self)
 
     async def next_page_callback(self, interaction: discord.Interaction):
         self.page += 1
         self.update_view()
-        await interaction.response.edit_message(view=self)
+        await interaction.response.edit_message(embed=self._get_page_embed(), view=self)
 
 # --- Views Principais ---
 class StopPlaylistView(ui.View):
@@ -261,7 +275,8 @@ class PlayerView(ui.View):
         if self.state.song_queue.empty():
             return await interaction.response.send_message("A fila está vazia, não há músicas para reordenar.", ephemeral=True)
         view = AdminQueuePaginator(interaction.user, self.state, self.cog)
-        await interaction.response.send_message("Selecione a música para tocar em seguida:", view=view, ephemeral=True)
+        embed = view._get_page_embed()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 # --- Classe Principal do Cog ---
 class MusicCog(commands.Cog, name="Music"):
@@ -479,6 +494,25 @@ class MusicCog(commands.Cog, name="Music"):
                 await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.artist('1dfeR4HaWDbWqFHLkxsg1d'))
                 await ctx.send("✅ **Conexão com a API do Spotify bem-sucedida!**")
             except Exception as e: await ctx.send(f"❌ **Falha ao conectar com a API do Spotify.**\n`Erro: {e}`")
+
+    @commands.command(name="splcheck", help="Verifica se uma playlist do Spotify está acessível.")
+    @commands.is_owner()
+    async def splcheck(self, ctx: commands.Context, *, url: str = None):
+        if url is None: return await ctx.send("Uso: `!splcheck <link da playlist do Spotify>`")
+        if not self.spotify_client: return await ctx.send("A integração com o Spotify não está configurada.")
+        
+        match = SPOTIFY_PLAYLIST_REGEX.match(url)
+        if not match: return await ctx.send("URL de playlist do Spotify inválida.")
+        playlist_id = match.group(1)
+
+        async with ctx.typing():
+            try:
+                playlist = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist(playlist_id, market="BR"))
+                await ctx.send(f"✅ **Playlist encontrada!**\n**Nome:** `{playlist['name']}`\n**Total de faixas:** `{playlist['tracks']['total']}`")
+            except spotipy.exceptions.SpotifyException as e:
+                await ctx.send(f"❌ **Falha ao buscar a playlist.**\n`Erro: {e}`\nIsso geralmente significa que as credenciais são inválidas ou a playlist é privada.")
+            except Exception as e:
+                await ctx.send(f"❌ **Ocorreu um erro inesperado.**\n`Erro: {e}`")
 
     @app_commands.command(name="nowplaying", description="Mostra informações da música que está tocando.")
     @is_not_banned()
