@@ -38,7 +38,7 @@ logger = logging.getLogger('discord_bot.music_cog')
 SPOTIFY_PLAYLIST_REGEX = re.compile(r"https://open.spotify.com/playlist/([a-zA-Z0-9]+)")
 PEER_SIZE = 20
 PEER_THRESHOLD = 5
-ADMIN_QUEUE_ITEMS_PER_PAGE = 5 # Músicas por página no menu admin
+ADMIN_QUEUE_ITEMS_PER_PAGE = 5
 
 # --- Decorator de Verificação de Ban ---
 def is_not_banned():
@@ -422,7 +422,7 @@ class MusicCog(commands.Cog, name="Music"):
         match = SPOTIFY_PLAYLIST_REGEX.match(url)
         if not match: return await ctx.send("URL de playlist do Spotify inválida.")
         
-        playlist_id = match.group(1) # [CORREÇÃO] Extrai o ID da URL
+        playlist_id = match.group(1)
 
         if not ctx.author.voice: return await ctx.send("Você precisa estar em um canal de voz.")
         if not ctx.guild.voice_client:
@@ -431,7 +431,8 @@ class MusicCog(commands.Cog, name="Music"):
         
         initial_message = await ctx.send(f"🔍 Analisando playlist...")
         try:
-            items = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist_tracks(playlist_id)['items'])
+            # [CORREÇÃO] Adiciona o parâmetro 'market' para aumentar a compatibilidade
+            items = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist_tracks(playlist_id, market="BR")['items'])
             if not items: return await initial_message.edit(content="Playlist vazia ou não encontrada.")
             
             state.reset_playlist_state()
