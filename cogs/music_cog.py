@@ -38,21 +38,19 @@ logger = logging.getLogger('discord_bot.music_cog')
 SPOTIFY_PLAYLIST_REGEX = re.compile(r"https://open.spotify.com/playlist/([a-zA-Z0-9]+)")
 PEER_SIZE = 20
 PEER_THRESHOLD = 5
+ADMIN_QUEUE_ITEMS_PER_PAGE = 5 # Músicas por página no menu admin
 
 # --- Decorator de Verificação de Ban ---
 def is_not_banned():
     async def predicate(ctx_or_interaction: any) -> bool:
         if isinstance(ctx_or_interaction, discord.Interaction):
-            author = ctx_or_interaction.user
-            bot = ctx_or_interaction.client
+            author = ctx_or_interaction.user; bot = ctx_or_interaction.client
         else:
-            author = ctx_or_interaction.author
-            bot = ctx_or_interaction.bot
+            author = ctx_or_interaction.author; bot = ctx_or_interaction.bot
             
         mod_cog = bot.get_cog("Moderation")
         if not mod_cog:
-            logging.warning("Cog de Moderação não encontrado. A verificação de bans não funcionará.")
-            return True
+            logging.warning("Cog de Moderação não encontrado."); return True
 
         member_id_str = str(author.id)
         bans = mod_cog._load_bans()
@@ -60,13 +58,9 @@ def is_not_banned():
         if member_id_str in bans:
             ban_info = bans[member_id_str]
             until = ban_info.get("until")
-            
             if until:
-                until_dt = datetime.fromisoformat(until)
-                if datetime.utcnow() > until_dt:
-                    del bans[member_id_str]
-                    mod_cog.bans = bans
-                    mod_cog._save_bans()
+                if datetime.utcnow() > datetime.fromisoformat(until):
+                    del bans[member_id_str]; mod_cog.bans = bans; mod_cog._save_bans()
                     return True
             
             if isinstance(ctx_or_interaction, discord.Interaction):
@@ -74,9 +68,7 @@ def is_not_banned():
             else:
                  await ctx_or_interaction.send("🚫 Você está proibido de usar os comandos de música.")
             return False
-        
         return True
-    
     return commands.check(predicate)
 
 # --- Componentes de Classes ---
@@ -84,32 +76,26 @@ def search_sync(query: str) -> Optional[dict]:
     with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
         try:
             data = ydl.extract_info(f"ytsearch:{query}", download=False)
-            if 'entries' in data and data['entries']:
-                return data['entries'][0]
+            if 'entries' in data and data['entries']: return data['entries'][0]
             return None
         except Exception as e:
-            logging.error(f"Erro no processo de busca do YTDL para '{query}': {e}")
-            return None
+            logging.error(f"Erro no processo de busca do YTDL para '{query}': {e}"); return None
 
 class LoopState(Enum):
     NONE = 0; SONG = 1; QUEUE = 2
 
 class Song:
     def __init__(self, data: dict, requester: discord.Member):
-        self.source_url: str = data['url']
-        self.title: str = data.get('title', 'Título Desconhecido')
-        self.thumbnail: Optional[str] = data.get('thumbnail')
-        self.duration: int = int(data.get('duration', 0))
-        self.requester: discord.Member = requester
-        self.webpage_url: str = data.get('webpage_url', '')
+        self.source_url: str = data['url']; self.title: str = data.get('title', 'Título Desconhecido')
+        self.thumbnail: Optional[str] = data.get('thumbnail'); self.duration: int = int(data.get('duration', 0))
+        self.requester: discord.Member = requester; self.webpage_url: str = data.get('webpage_url', '')
 
 class GuildState:
     def __init__(self, loop: asyncio.AbstractEventLoop, cog_instance: 'MusicCog'):
         self.cog_instance = cog_instance; self.loop = loop
         self.song_queue = asyncio.Queue(maxsize=200)
         self.play_next_song = asyncio.Event()
-        self.current_song: Optional[Song] = None
-        self.player_task: Optional[asyncio.Task] = None
+        self.current_song: Optional[Song] = None; self.player_task: Optional[asyncio.Task] = None
         self.menu_message: Optional[discord.WebhookMessage] = None
         self.volume: float = 0.5; self.loop_state: LoopState = LoopState.NONE
         self.song_start_time: Optional[float] = None; self.playlist_mode: bool = False
@@ -118,11 +104,9 @@ class GuildState:
         self.playlist_tracks_to_search: List[str] = []; self.playlist_loader_task: Optional[asyncio.Task] = None
 
     def reset_playlist_state(self):
-        self.playlist_mode = False; self.playlist_requester = None
-        self.playlist_total_tracks = 0; self.playlist_loaded_tracks = 0
+        self.playlist_mode = False; self.playlist_requester = None; self.playlist_total_tracks = 0; self.playlist_loaded_tracks = 0
         self.playlist_tracks_to_search.clear()
-        if self.playlist_loader_task and not self.playlist_loader_task.done():
-            self.playlist_loader_task.cancel()
+        if self.playlist_loader_task and not self.playlist_loader_task.done(): self.playlist_loader_task.cancel()
         while not self.song_queue.empty():
             try: self.song_queue.get_nowait()
             except asyncio.QueueEmpty: continue
@@ -135,45 +119,78 @@ class GuildState:
         try:
             await self.menu_message.edit(embed=embed, view=view)
         except (discord.NotFound, discord.HTTPException) as e:
-            logger.warning(f"Não foi possível editar a mensagem do menu: {e}")
-            self.menu_message = None
+            logger.warning(f"Não foi possível editar a mensagem do menu: {e}"); self.menu_message = None
 
-# --- Views Interativas ---
-class AdminQueueSelect(ui.Select):
-    def __init__(self, state: GuildState):
-        self.state = state
-        options = [discord.SelectOption(label=f"#{i+1}: {song.title[:80]}", value=str(i)) for i, song in enumerate(list(state.song_queue._queue)[:25])]
-        super().__init__(placeholder="Selecione uma música para tocar em seguida...", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        selected_index = int(self.values[0])
-        queue_list = list(self.state.song_queue._queue)
-        song_to_move = queue_list.pop(selected_index)
-        while not self.state.song_queue.empty():
-            try: self.state.song_queue.get_nowait()
-            except asyncio.QueueEmpty: continue
-        await self.state.song_queue.put(song_to_move)
-        for song in queue_list: await self.state.song_queue.put(song)
-        await self.state.update_menu()
-        await interaction.followup.send(f"✅ **{song_to_move.title}** foi movida para o topo da fila.", ephemeral=True, delete_after=10)
-        await interaction.message.delete()
-
-class AdminQueueView(ui.View):
-    def __init__(self, author: discord.Member, state: GuildState):
+# --- [NOVO] Views Paginadas para o Menu Admin ---
+class AdminQueuePaginator(ui.View):
+    def __init__(self, author: discord.Member, state: GuildState, cog: 'MusicCog'):
         super().__init__(timeout=180)
-        self.author = author; self.add_item(AdminQueueSelect(state))
+        self.author = author; self.state = state; self.cog = cog
+        self.queue_list = list(state.song_queue._queue)
+        self.page = 0
+        self.total_pages = max(0, (len(self.queue_list) - 1) // ADMIN_QUEUE_ITEMS_PER_PAGE)
+        self.update_view()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author.id:
-            await interaction.response.send_message("Você não pode usar este menu.", ephemeral=True)
-            return False
+            await interaction.response.send_message("Você não pode usar este menu.", ephemeral=True); return False
         return True
 
+    def update_view(self):
+        self.clear_items()
+        start_index = self.page * ADMIN_QUEUE_ITEMS_PER_PAGE
+        end_index = start_index + ADMIN_QUEUE_ITEMS_PER_PAGE
+        page_songs = self.queue_list[start_index:end_index]
+        
+        options = [discord.SelectOption(label=f"#{i + 1 + start_index}: {song.title[:80]}", value=str(i + start_index)) for i, song in enumerate(page_songs)]
+        if options:
+            select = ui.Select(placeholder=f"Página {self.page + 1}/{self.total_pages + 1} - Selecione uma música...", options=options)
+            select.callback = self.select_callback
+            self.add_item(select)
+        
+        prev_button = ui.Button(label="Anterior", emoji="◀️", disabled=self.page == 0, row=1)
+        prev_button.callback = self.prev_page_callback
+        self.add_item(prev_button)
+
+        next_button = ui.Button(label="Próxima", emoji="▶️", disabled=self.page >= self.total_pages, row=1)
+        next_button.callback = self.next_page_callback
+        self.add_item(next_button)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        selected_index = int(interaction.data['values'][0])
+        
+        song_to_move = self.queue_list.pop(selected_index)
+        
+        while not self.state.song_queue.empty():
+            try: self.state.song_queue.get_nowait()
+            except asyncio.QueueEmpty: continue
+            
+        await self.state.song_queue.put(song_to_move)
+        for song in self.queue_list: await self.state.song_queue.put(song)
+        
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop() # Força o player a pegar a próxima música da fila
+            
+        await interaction.followup.send(f"✅ **{song_to_move.title}** foi movida para o topo e será a próxima a tocar.", ephemeral=True, delete_after=10)
+        await interaction.message.delete()
+        await self.state.update_menu()
+
+    async def prev_page_callback(self, interaction: discord.Interaction):
+        self.page -= 1
+        self.update_view()
+        await interaction.response.edit_message(view=self)
+
+    async def next_page_callback(self, interaction: discord.Interaction):
+        self.page += 1
+        self.update_view()
+        await interaction.response.edit_message(view=self)
+
+# --- Views Principais ---
 class StopPlaylistView(ui.View):
     def __init__(self, cog: 'MusicCog'):
         super().__init__(timeout=60); self.cog = cog
-    
     @ui.button(label="Parar Playlist e Limpar Fila", style=discord.ButtonStyle.danger, emoji="⏹️")
     async def stop_playlist(self, interaction: discord.Interaction, button: ui.Button):
         await self.cog.stop_player(interaction)
@@ -243,10 +260,10 @@ class PlayerView(ui.View):
             return await interaction.response.send_message("🚫 Apenas administradores podem usar esta função.", ephemeral=True)
         if self.state.song_queue.empty():
             return await interaction.response.send_message("A fila está vazia, não há músicas para reordenar.", ephemeral=True)
-        view = AdminQueueView(interaction.user, self.state)
+        view = AdminQueuePaginator(interaction.user, self.state, self.cog)
         await interaction.response.send_message("Selecione a música para tocar em seguida:", view=view, ephemeral=True)
 
-# --- Classe Principal do Cog de Música ---
+# --- Classe Principal do Cog ---
 class MusicCog(commands.Cog, name="Music"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot; self.guild_states: Dict[int, GuildState] = {}
@@ -273,57 +290,46 @@ class MusicCog(commands.Cog, name="Music"):
         if state.menu_message:
             try:
                 embed = discord.Embed(title="Player Desconectado", description="Até a próxima! 👋", color=discord.Color.red())
+                embed.set_footer(text="Desenvolvido por: Douglas Batista")
                 await state.menu_message.edit(embed=embed, view=None)
             except (discord.NotFound, discord.HTTPException): pass
         if guild.id in self.guild_states: del self.guild_states[guild.id]
         logger.info(f"Estado do servidor '{guild.name}' foi limpo.")
 
     def _player_finished_callback(self, state: GuildState, error=None):
-        if error:
-            logger.error(f"Erro no player (pode ser normal ao pular música): {error}", exc_info=error)
-        else:
-            logger.info(f"Reprodução de '{state.current_song.title}' finalizada em '{state.current_song.requester.guild.name}'.")
+        if error: logger.error(f"Erro no player: {error}", exc_info=error)
+        else: logger.info(f"Reprodução de '{state.current_song.title}' finalizada.")
         state.play_next_song.set()
 
     async def _player_loop(self, guild_id: int):
         state = self.get_guild_state(guild_id)
         guild = self.bot.get_guild(guild_id)
         if not guild: return await self._cleanup(guild)
-
         while True:
             state.play_next_song.clear()
-
-            voice_client = guild.voice_client
-            if not voice_client or not voice_client.is_connected():
-                logger.warning(f"Player loop para '{guild.name}' detectou desconexão. Limpando.")
-                return await self._cleanup(guild)
-                
+            vc = guild.voice_client
+            if not vc or not vc.is_connected():
+                logger.warning(f"Player loop detectou desconexão. Limpando."); return await self._cleanup(guild)
             try:
                 song_to_play = await asyncio.wait_for(state.song_queue.get(), timeout=300.0)
             except asyncio.TimeoutError:
-                logger.info(f"Fila vazia por 5 minutos em '{guild.name}'. Desconectando.")
-                if guild.voice_client and not guild.voice_client.is_playing():
-                    if state.menu_message and state.menu_message.channel:
+                logger.info(f"Fila vazia por 5 minutos. Desconectando.")
+                if vc and not vc.is_playing():
+                   if state.menu_message and state.menu_message.channel:
                        await state.menu_message.channel.send("Fila vazia. Desconectando por inatividade.", delete_after=30)
-                    return await self._cleanup(guild)
+                   return await self._cleanup(guild)
                 continue
-
             state.current_song = song_to_play
-            
             try:
                 source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(song_to_play.source_url, **FFMPEG_OPTIONS), volume=state.volume)
-                
-                voice_client.play(source, after=lambda e: self._player_finished_callback(state, e))
-                
+                vc.play(source, after=lambda e: self._player_finished_callback(state, e))
                 state.song_start_time = time.time()
-                logger.info(f"Iniciando reprodução de '{song_to_play.title}' em '{guild.name}'.")
-                
+                logger.info(f"Iniciando reprodução de '{song_to_play.title}'.")
             except Exception as e:
-                logger.error(f"Erro CRÍTICO ao iniciar a reprodução de '{song_to_play.title}': {e}", exc_info=True)
+                logger.error(f"Erro CRÍTICO ao iniciar a reprodução: {e}", exc_info=True)
                 if state.menu_message and state.menu_message.channel:
                     await state.menu_message.channel.send(f"⚠️ Erro ao tocar `{song_to_play.title}`. Pulando para a próxima.", delete_after=15)
-                state.play_next_song.set() # Desbloqueia o loop se a reprodução falhar
-            
+                state.play_next_song.set()
             await state.update_menu()
             await state.play_next_song.wait()
 
@@ -331,11 +337,9 @@ class MusicCog(commands.Cog, name="Music"):
         try:
             data = await self.bot.loop.run_in_executor(self.process_executor, search_sync, query)
             if data: return Song(data, requester)
-            logger.warning(f"Nenhum resultado encontrado para: '{query}'")
-            return None
+            logger.warning(f"Nenhum resultado encontrado para: '{query}'"); return None
         except Exception as e:
-            logger.error(f"Erro ao buscar '{query}': {e}")
-            return None
+            logger.error(f"Erro ao buscar '{query}': {e}"); return None
 
     def build_player_embed(self, state: GuildState) -> discord.Embed:
         if state.current_song:
@@ -349,43 +353,37 @@ class MusicCog(commands.Cog, name="Music"):
             queue_text = f"📜 Fila: {state.song_queue.qsize()}"
             if state.playlist_mode: queue_text += f" (+{len(state.playlist_tracks_to_search)} a buscar)"
             queue_text += f" | Loop: {state.loop_state.name.capitalize()}"
-            embed.set_footer(text=queue_text)
         else:
             embed = discord.Embed(title="Player Parado", description="Use `/play` para adicionar uma música!", color=discord.Color.greyple())
-            embed.set_footer(text="Aguardando músicas...")
+            queue_text = "Aguardando músicas..."
+        embed.set_footer(text=f"{queue_text}\nDesenvolvido por: Douglas Batista")
         return embed
 
     async def _playlist_peer_loader_loop(self, guild_id: int, requester: discord.Member, initial_message: discord.Message):
         state = self.get_guild_state(guild_id)
-        logger.info(f"Iniciando carregador de playlist para '{requester.guild.name}'.")
-        
+        logger.info(f"Iniciando carregador de playlist.")
         if state.playlist_tracks_to_search:
-            first_track_query = state.playlist_tracks_to_search.pop(0)
-            await initial_message.edit(content=f"▶️ Buscando a primeira música: `{first_track_query[:50]}...`")
-            first_song = await self._search_song(first_track_query, requester)
+            first_query = state.playlist_tracks_to_search.pop(0)
+            await initial_message.edit(content=f"▶️ Buscando a primeira música: `{first_query[:50]}...`")
+            first_song = await self._search_song(first_query, requester)
             if first_song:
-                await state.song_queue.put(first_song)
-                state.playlist_loaded_tracks += 1
-                await initial_message.edit(content=f"Tocando `{first_song.title}`. Carregando as outras {len(state.playlist_tracks_to_search)} músicas em segundo plano...")
-            else:
-                await initial_message.edit(content=f"Não achei a primeira música. Tentando a próxima...")
-
+                await state.song_queue.put(first_song); state.playlist_loaded_tracks += 1
+                await initial_message.edit(content=f"Tocando `{first_song.title}`. Carregando as outras {len(state.playlist_tracks_to_search) + 1} músicas...")
+            else: await initial_message.edit(content=f"Não achei a primeira música. Tentando a próxima...")
         while state.playlist_tracks_to_search:
             try:
                 if state.song_queue.qsize() <= PEER_THRESHOLD:
-                    next_peer_size = min(PEER_SIZE, len(state.playlist_tracks_to_search))
-                    queries = [state.playlist_tracks_to_search.pop(0) for _ in range(next_peer_size)]
+                    queries = [state.playlist_tracks_to_search.pop(0) for _ in range(min(PEER_SIZE, len(state.playlist_tracks_to_search)))]
                     for query in queries:
                         song = await self._search_song(query, requester)
                         if song: await state.song_queue.put(song); state.playlist_loaded_tracks += 1
                         await asyncio.sleep(0.5)
                     await state.update_menu()
                 await asyncio.sleep(5)
-            except asyncio.CancelledError: logger.info(f"Carregador de playlist para '{requester.guild.name}' cancelado."); break
-            except Exception as e: logger.error(f"Erro no carregador de playlist para '{requester.guild.name}': {e}", exc_info=e); break
-        
+            except asyncio.CancelledError: logger.info(f"Carregador de playlist cancelado."); break
+            except Exception as e: logger.error(f"Erro no carregador de playlist: {e}", exc_info=e); break
         state.playlist_mode = False
-        logger.info(f"Carregador de playlist para '{requester.guild.name}' concluído.")
+        logger.info(f"Carregador de playlist concluído.")
 
     # --- COMANDOS ---
     @app_commands.command(name="play", description="Toca uma música do YouTube.")
@@ -435,10 +433,8 @@ class MusicCog(commands.Cog, name="Music"):
             state.playlist_tracks_to_search = [f"{item['track']['name']} {item['track']['artists'][0]['name']}" for item in items if item.get('track')]
             state.playlist_total_tracks = len(state.playlist_tracks_to_search)
             if not state.playlist_tracks_to_search: return await initial_message.edit(content="Não extraí músicas válidas da playlist.")
-            
             if not state.player_task or state.player_task.done():
                 state.player_task = self.bot.loop.create_task(self._player_loop(ctx.guild.id))
-
             state.playlist_loader_task = self.bot.loop.create_task(self._playlist_peer_loader_loop(ctx.guild.id, ctx.author, initial_message))
         except Exception as e:
             logger.error(f"Erro ao processar playlist '{url}': {e}", exc_info=e)
@@ -453,7 +449,7 @@ class MusicCog(commands.Cog, name="Music"):
         embed.add_field(name="Status", value="Playlist em processamento", inline=False)
         embed.add_field(name="Pedido por", value=state.playlist_requester.mention, inline=False)
         embed.add_field(name="Progresso", value=f"`{state.playlist_loaded_tracks} / {state.playlist_total_tracks}` músicas carregadas", inline=False)
-        embed.set_footer(text=f"Fila atual: {state.song_queue.qsize()} músicas prontas para tocar.")
+        embed.set_footer(text=f"Fila atual: {state.song_queue.qsize()} músicas prontas para tocar.\nDesenvolvido por: Douglas Batista")
         await ctx.send(embed=embed)
 
     @commands.command(name="connect", help="Testa a conexão com a API do Spotify.")
