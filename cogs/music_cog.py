@@ -425,15 +425,16 @@ class MusicCog(commands.Cog, name="Music"):
         playlist_id = match.group(1)
 
         if not ctx.author.voice: return await ctx.send("Você precisa estar em um canal de voz.")
-        if not ctx.guild.voice_client:
-            try: await ctx.author.voice.channel.connect()
-            except Exception as e: return await ctx.send(f"Não consegui conectar: {e}")
         
         initial_message = await ctx.send(f"🔍 Analisando playlist...")
         try:
             items = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist_tracks(playlist_id, market="BR")['items'])
             if not items: return await initial_message.edit(content="Playlist vazia ou não encontrada.")
             
+            if not ctx.guild.voice_client:
+                try: await ctx.author.voice.channel.connect()
+                except Exception as e: return await initial_message.edit(content=f"Não consegui conectar ao seu canal de voz: {e}")
+
             state.reset_playlist_state()
             state.playlist_mode = True
             state.playlist_requester = ctx.author
