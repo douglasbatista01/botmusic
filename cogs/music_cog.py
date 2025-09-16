@@ -121,7 +121,7 @@ class GuildState:
         except (discord.NotFound, discord.HTTPException) as e:
             logger.warning(f"Não foi possível editar a mensagem do menu: {e}"); self.menu_message = None
 
-# --- [NOVO] Views Paginadas para o Menu Admin ---
+# --- Views Paginadas para o Menu Admin ---
 class AdminQueuePaginator(ui.View):
     def __init__(self, author: discord.Member, state: GuildState, cog: 'MusicCog'):
         super().__init__(timeout=180)
@@ -418,27 +418,37 @@ class MusicCog(commands.Cog, name="Music"):
             return await ctx.send(embed=embed, view=StopPlaylistView(self))
         if url is None: return await ctx.send("Uso: `!pl <link da playlist do Spotify>`")
         if not self.spotify_client: return await ctx.send("A integração com o Spotify não está configurada.")
-        if not SPOTIFY_PLAYLIST_REGEX.match(url): return await ctx.send("URL de playlist do Spotify inválida.")
+        
+        match = SPOTIFY_PLAYLIST_REGEX.match(url)
+        if not match: return await ctx.send("URL de playlist do Spotify inválida.")
+        
+        playlist_id = match.group(1) # [CORREÇÃO] Extrai o ID da URL
+
         if not ctx.author.voice: return await ctx.send("Você precisa estar em um canal de voz.")
         if not ctx.guild.voice_client:
             try: await ctx.author.voice.channel.connect()
             except Exception as e: return await ctx.send(f"Não consegui conectar: {e}")
+        
         initial_message = await ctx.send(f"🔍 Analisando playlist...")
         try:
-            items = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist_tracks(url)['items'])
+            items = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist_tracks(playlist_id)['items'])
             if not items: return await initial_message.edit(content="Playlist vazia ou não encontrada.")
+            
             state.reset_playlist_state()
             state.playlist_mode = True
             state.playlist_requester = ctx.author
             state.playlist_tracks_to_search = [f"{item['track']['name']} {item['track']['artists'][0]['name']}" for item in items if item.get('track')]
             state.playlist_total_tracks = len(state.playlist_tracks_to_search)
+            
             if not state.playlist_tracks_to_search: return await initial_message.edit(content="Não extraí músicas válidas da playlist.")
+            
             if not state.player_task or state.player_task.done():
                 state.player_task = self.bot.loop.create_task(self._player_loop(ctx.guild.id))
+            
             state.playlist_loader_task = self.bot.loop.create_task(self._playlist_peer_loader_loop(ctx.guild.id, ctx.author, initial_message))
         except Exception as e:
             logger.error(f"Erro ao processar playlist '{url}': {e}", exc_info=e)
-            await initial_message.edit(content="Ocorreu um erro ao buscar a playlist.")
+            await initial_message.edit(content="Ocorreu um erro ao buscar a playlist. Verifique se o link está correto e a playlist é pública.")
 
     @commands.command(name="status", help="Mostra o status da playlist em andamento.")
     @is_not_banned()
