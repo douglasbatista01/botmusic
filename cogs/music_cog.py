@@ -279,32 +279,51 @@ class MusicCog(commands.Cog, name="Music"):
         logger.info(f"Estado do servidor '{guild.name}' foi limpo.")
 
     def _player_finished_callback(self, state: GuildState, error=None):
-        if error: logger.error(f"Erro no player: {error}", exc_info=error)
+        if error:
+            logger.error(f"Erro no player (pode ser normal ao pular música): {error}", exc_info=error)
+        else:
+            logger.info(f"Reprodução de '{state.current_song.title}' finalizada em '{state.current_song.requester.guild.name}'.")
         state.play_next_song.set()
 
     async def _player_loop(self, guild_id: int):
         state = self.get_guild_state(guild_id)
         guild = self.bot.get_guild(guild_id)
         if not guild: return await self._cleanup(guild)
+
         while True:
             state.play_next_song.clear()
-            song_to_play = None
-            if state.loop_state == LoopState.SONG and state.current_song: song_to_play = state.current_song
-            else:
-                if state.loop_state == LoopState.QUEUE and state.current_song: await state.song_queue.put(state.current_song)
-                try: song_to_play = await asyncio.wait_for(state.song_queue.get(), timeout=300.0)
-                except asyncio.TimeoutError:
-                    logger.info(f"Fila vazia por 5 minutos em '{guild.name}'. Desconectando.")
-                    await self._cleanup(guild)
+
+            voice_client = guild.voice_client
+            if not voice_client or not voice_client.is_connected():
+                logger.warning(f"Player loop para '{guild.name}' detectou desconexão. Limpando.")
+                return await self._cleanup(guild)
+                
+            try:
+                song_to_play = await asyncio.wait_for(state.song_queue.get(), timeout=300.0)
+            except asyncio.TimeoutError:
+                logger.info(f"Fila vazia por 5 minutos em '{guild.name}'. Desconectando.")
+                if guild.voice_client and not guild.voice_client.is_playing():
                     if state.menu_message and state.menu_message.channel:
                        await state.menu_message.channel.send("Fila vazia. Desconectando por inatividade.", delete_after=30)
-                    return
+                    return await self._cleanup(guild)
+                continue
+
             state.current_song = song_to_play
-            voice_client = guild.voice_client
-            if not voice_client: return await self._cleanup(guild)
-            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(song_to_play.source_url, **FFMPEG_OPTIONS), volume=state.volume)
-            state.song_start_time = time.time()
-            voice_client.play(source, after=lambda e: self._player_finished_callback(state, e))
+            
+            try:
+                source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(song_to_play.source_url, **FFMPEG_OPTIONS), volume=state.volume)
+                
+                voice_client.play(source, after=lambda e: self._player_finished_callback(state, e))
+                
+                state.song_start_time = time.time()
+                logger.info(f"Iniciando reprodução de '{song_to_play.title}' em '{guild.name}'.")
+                
+            except Exception as e:
+                logger.error(f"Erro CRÍTICO ao iniciar a reprodução de '{song_to_play.title}': {e}", exc_info=True)
+                if state.menu_message and state.menu_message.channel:
+                    await state.menu_message.channel.send(f"⚠️ Erro ao tocar `{song_to_play.title}`. Pulando para a próxima.", delete_after=15)
+                state.play_next_song.set() # Desbloqueia o loop se a reprodução falhar
+            
             await state.update_menu()
             await state.play_next_song.wait()
 
@@ -340,10 +359,9 @@ class MusicCog(commands.Cog, name="Music"):
         state = self.get_guild_state(guild_id)
         logger.info(f"Iniciando carregador de playlist para '{requester.guild.name}'.")
         
-        # --- [NOVO] Lógica de Início Rápido ---
         if state.playlist_tracks_to_search:
             first_track_query = state.playlist_tracks_to_search.pop(0)
-            await initial_message.edit(content=f"▶️ Tocando a primeira música: `{first_track_query[:50]}...`")
+            await initial_message.edit(content=f"▶️ Buscando a primeira música: `{first_track_query[:50]}...`")
             first_song = await self._search_song(first_track_query, requester)
             if first_song:
                 await state.song_queue.put(first_song)
@@ -352,7 +370,6 @@ class MusicCog(commands.Cog, name="Music"):
             else:
                 await initial_message.edit(content=f"Não achei a primeira música. Tentando a próxima...")
 
-        # --- Carregamento em Lotes (Restante da Playlist) ---
         while state.playlist_tracks_to_search:
             try:
                 if state.song_queue.qsize() <= PEER_THRESHOLD:
@@ -419,10 +436,9 @@ class MusicCog(commands.Cog, name="Music"):
             state.playlist_total_tracks = len(state.playlist_tracks_to_search)
             if not state.playlist_tracks_to_search: return await initial_message.edit(content="Não extraí músicas válidas da playlist.")
             
-            # Inicia o player loop se não estiver rodando
             if not state.player_task or state.player_task.done():
                 state.player_task = self.bot.loop.create_task(self._player_loop(ctx.guild.id))
-            # Inicia o carregador em paralelo
+
             state.playlist_loader_task = self.bot.loop.create_task(self._playlist_peer_loader_loop(ctx.guild.id, ctx.author, initial_message))
         except Exception as e:
             logger.error(f"Erro ao processar playlist '{url}': {e}", exc_info=e)
@@ -523,7 +539,7 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.command(name="menu", description="Recria o painel de controle interativo do player.")
     @is_not_banned()
     async def menu(self, interaction: discord.Interaction):
-        state = self.get_guild_state(interaction.guild_id)
+        state = self.get_guild_state(interaction.guild.id)
         if state.menu_message:
             try: await state.menu_message.delete()
             except (discord.NotFound, discord.HTTPException): pass
