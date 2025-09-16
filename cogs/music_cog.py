@@ -6,7 +6,7 @@ import time
 import os
 import re
 from enum import Enum
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Union
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 
@@ -121,7 +121,7 @@ class GuildState:
         except (discord.NotFound, discord.HTTPException) as e:
             logger.warning(f"Não foi possível editar a mensagem do menu: {e}"); self.menu_message = None
 
-# --- [NOVO] Views Paginadas para o Menu Admin ---
+# --- Views Paginadas para o Menu Admin ---
 class AdminQueuePaginator(ui.View):
     def __init__(self, author: discord.Member, state: GuildState, cog: 'MusicCog'):
         super().__init__(timeout=180)
@@ -400,6 +400,93 @@ class MusicCog(commands.Cog, name="Music"):
         state.playlist_mode = False
         logger.info(f"Carregador de playlist concluído.")
 
+    # --- Lógica Centralizada de Playlist ---
+    async def _add_playlist(self, interaction_or_ctx: Union[discord.Interaction, commands.Context], url: str):
+        is_interaction = isinstance(interaction_or_ctx, discord.Interaction)
+        author = interaction_or_ctx.user if is_interaction else interaction_or_ctx.author
+        guild = interaction_or_ctx.guild
+        channel = interaction_or_ctx.channel
+
+        state = self.get_guild_state(guild.id)
+        if state.playlist_mode:
+            embed = discord.Embed(title="Playlist em Andamento", description=f"Uma playlist pedida por **{state.playlist_requester.display_name}** está tocando.", color=discord.Color.orange())
+            if is_interaction: await interaction_or_ctx.response.send_message(embed=embed, view=StopPlaylistView(self), ephemeral=True)
+            else: await channel.send(embed=embed, view=StopPlaylistView(self))
+            return
+
+        if not self.spotify_client:
+            msg = "A integração com o Spotify não está configurada."
+            if is_interaction: await interaction_or_ctx.response.send_message(msg, ephemeral=True)
+            else: await channel.send(msg)
+            return
+        
+        match = SPOTIFY_PLAYLIST_REGEX.match(url)
+        if not match:
+            msg = "URL de playlist do Spotify inválida."
+            if is_interaction: await interaction_or_ctx.response.send_message(msg, ephemeral=True)
+            else: await channel.send(msg)
+            return
+
+        playlist_id = match.group(1)
+        if not author.voice:
+            msg = "Você precisa estar em um canal de voz."
+            if is_interaction: await interaction_or_ctx.response.send_message(msg, ephemeral=True)
+            else: await channel.send(msg)
+            return
+        
+        initial_message = None
+        if is_interaction:
+            await interaction_or_ctx.response.defer(thinking=True, ephemeral=True)
+        else:
+            initial_message = await channel.send(f"🔍 Analisando playlist...")
+
+        try:
+            items = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist_tracks(playlist_id, market="BR")['items'])
+            if not items:
+                msg = "Playlist vazia ou não encontrada."
+                if is_interaction: await interaction_or_ctx.followup.send(msg, ephemeral=True)
+                else: await initial_message.edit(content=msg)
+                return
+            
+            if not guild.voice_client:
+                try: await author.voice.channel.connect()
+                except Exception as e:
+                    msg = f"Não consegui conectar ao seu canal de voz: {e}"
+                    if is_interaction: await interaction_or_ctx.followup.send(msg, ephemeral=True)
+                    else: await initial_message.edit(content=msg)
+                    return
+
+            state.reset_playlist_state()
+            state.playlist_mode = True
+            state.playlist_requester = author
+            state.playlist_tracks_to_search = [f"{item['track']['name']} {item['track']['artists'][0]['name']}" for item in items if item.get('track')]
+            state.playlist_total_tracks = len(state.playlist_tracks_to_search)
+            
+            if not state.playlist_tracks_to_search:
+                msg = "Não extraí músicas válidas da playlist."
+                if is_interaction: await interaction_or_ctx.followup.send(msg, ephemeral=True)
+                else: await initial_message.edit(content=msg)
+                return
+            
+            if is_interaction: # For slash commands, the followup is the initial message
+                initial_message = await interaction_or_ctx.original_response()
+
+            if not state.player_task or state.player_task.done():
+                state.player_task = self.bot.loop.create_task(self._player_loop(guild.id))
+            
+            state.playlist_loader_task = self.bot.loop.create_task(self._playlist_peer_loader_loop(guild.id, author, initial_message))
+
+        except spotipy.exceptions.SpotifyException as e:
+            msg = "❌ **Playlist não encontrada.**\n\nPor favor, verifique se:\n1. O link está correto.\n2. A playlist é **pública**.\n3. (Para o dono do bot) As credenciais da API do Spotify estão válidas (`!connect`)."
+            logger.error(f"Spotify playlist não encontrada (404): {url}")
+            if is_interaction: await interaction_or_ctx.followup.send(msg, ephemeral=True)
+            else: await initial_message.edit(content=msg)
+        except Exception as e:
+            msg = "Ocorreu um erro ao buscar a playlist. Verifique o link e tente novamente."
+            logger.error(f"Erro geral ao processar playlist '{url}': {e}", exc_info=e)
+            if is_interaction: await interaction_or_ctx.followup.send(msg, ephemeral=True)
+            else: await initial_message.edit(content=msg)
+
     # --- COMANDOS ---
     @app_commands.command(name="play", description="Toca uma música do YouTube.")
     @is_not_banned()
@@ -427,51 +514,16 @@ class MusicCog(commands.Cog, name="Music"):
     @commands.command(name="pl", help="Adiciona uma playlist do Spotify. Uso: !pl <link>")
     @is_not_banned()
     async def pl(self, ctx: commands.Context, *, url: str = None):
-        state = self.get_guild_state(ctx.guild.id)
-        if state.playlist_mode:
-            embed = discord.Embed(title="Playlist em Andamento", description=f"Uma playlist pedida por **{state.playlist_requester.display_name}** está tocando.", color=discord.Color.orange())
-            return await ctx.send(embed=embed, view=StopPlaylistView(self))
-        if url is None: return await ctx.send("Uso: `!pl <link da playlist do Spotify>`")
-        if not self.spotify_client: return await ctx.send("A integração com o Spotify não está configurada.")
-        
-        match = SPOTIFY_PLAYLIST_REGEX.match(url)
-        if not match: return await ctx.send("URL de playlist do Spotify inválida.")
-        
-        playlist_id = match.group(1)
+        if url is None:
+            await ctx.send("Uso: `!pl <link da playlist do Spotify>`")
+            return
+        await self._add_playlist(ctx, url)
 
-        if not ctx.author.voice: return await ctx.send("Você precisa estar em um canal de voz.")
-        
-        initial_message = await ctx.send(f"🔍 Analisando playlist...")
-        try:
-            items = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist_tracks(playlist_id, market="BR")['items'])
-            if not items: return await initial_message.edit(content="Playlist vazia ou não encontrada.")
-            
-            if not ctx.guild.voice_client:
-                try: await ctx.author.voice.channel.connect()
-                except Exception as e: return await initial_message.edit(content=f"Não consegui conectar ao seu canal de voz: {e}")
-
-            state.reset_playlist_state()
-            state.playlist_mode = True
-            state.playlist_requester = ctx.author
-            state.playlist_tracks_to_search = [f"{item['track']['name']} {item['track']['artists'][0]['name']}" for item in items if item.get('track')]
-            state.playlist_total_tracks = len(state.playlist_tracks_to_search)
-            
-            if not state.playlist_tracks_to_search: return await initial_message.edit(content="Não extraí músicas válidas da playlist.")
-            
-            if not state.player_task or state.player_task.done():
-                state.player_task = self.bot.loop.create_task(self._player_loop(ctx.guild.id))
-            
-            state.playlist_loader_task = self.bot.loop.create_task(self._playlist_peer_loader_loop(ctx.guild.id, ctx.author, initial_message))
-        except spotipy.exceptions.SpotifyException as e:
-            if e.http_status == 404:
-                logger.error(f"Spotify playlist não encontrada (404): {url}")
-                await initial_message.edit(content="❌ **Playlist não encontrada.**\n\nPor favor, verifique se:\n1. O link está correto.\n2. A playlist é **pública**.\n3. (Para o dono do bot) As credenciais da API do Spotify estão válidas (`!connect`).")
-            else:
-                logger.error(f"Erro inesperado do Spotify ao processar playlist '{url}': {e}", exc_info=e)
-                await initial_message.edit(content="Ocorreu um erro inesperado com a API do Spotify. Tente novamente mais tarde.")
-        except Exception as e:
-            logger.error(f"Erro geral ao processar playlist '{url}': {e}", exc_info=e)
-            await initial_message.edit(content="Ocorreu um erro ao buscar a playlist. Verifique o link e tente novamente.")
+    @app_commands.command(name="list", description="Adiciona uma playlist do Spotify à fila.")
+    @app_commands.describe(url="O link da playlist do Spotify.")
+    @is_not_banned()
+    async def list_command(self, interaction: discord.Interaction, url: str):
+        await self._add_playlist(interaction, url)
 
     @commands.command(name="status", help="Mostra o status da playlist em andamento.")
     @is_not_banned()
@@ -590,7 +642,7 @@ class MusicCog(commands.Cog, name="Music"):
         state = self.get_guild_state(interaction.guild.id)
         if state.menu_message:
             try: await state.menu_message.delete()
-            except (discord.NotFound, discord.HTTPException): pass
+            except (discord.NotFound, discord.HTTPException): passa
         embed = self.build_player_embed(state)
         view = PlayerView(self, state)
         state.menu_message = await interaction.channel.send(embed=embed, view=view)
