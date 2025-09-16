@@ -431,7 +431,6 @@ class MusicCog(commands.Cog, name="Music"):
         
         initial_message = await ctx.send(f"🔍 Analisando playlist...")
         try:
-            # [CORREÇÃO] Adiciona o parâmetro 'market' para aumentar a compatibilidade
             items = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist_tracks(playlist_id, market="BR")['items'])
             if not items: return await initial_message.edit(content="Playlist vazia ou não encontrada.")
             
@@ -447,9 +446,16 @@ class MusicCog(commands.Cog, name="Music"):
                 state.player_task = self.bot.loop.create_task(self._player_loop(ctx.guild.id))
             
             state.playlist_loader_task = self.bot.loop.create_task(self._playlist_peer_loader_loop(ctx.guild.id, ctx.author, initial_message))
+        except spotipy.exceptions.SpotifyException as e:
+            if e.http_status == 404:
+                logger.error(f"Spotify playlist não encontrada (404): {url}")
+                await initial_message.edit(content="❌ **Playlist não encontrada.**\n\nPor favor, verifique se:\n1. O link está correto.\n2. A playlist é **pública**.\n3. (Para o dono do bot) As credenciais da API do Spotify estão válidas (`!connect`).")
+            else:
+                logger.error(f"Erro inesperado do Spotify ao processar playlist '{url}': {e}", exc_info=e)
+                await initial_message.edit(content="Ocorreu um erro inesperado com a API do Spotify. Tente novamente mais tarde.")
         except Exception as e:
-            logger.error(f"Erro ao processar playlist '{url}': {e}", exc_info=e)
-            await initial_message.edit(content="Ocorreu um erro ao buscar a playlist. Verifique se o link está correto e a playlist é pública.")
+            logger.error(f"Erro geral ao processar playlist '{url}': {e}", exc_info=e)
+            await initial_message.edit(content="Ocorreu um erro ao buscar a playlist. Verifique o link e tente novamente.")
 
     @commands.command(name="status", help="Mostra o status da playlist em andamento.")
     @is_not_banned()
