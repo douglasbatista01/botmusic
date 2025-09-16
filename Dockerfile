@@ -1,6 +1,10 @@
 # Use uma imagem base oficial do Python
 FROM python:3.10-slim
 
+# [CORREÇÃO DEFINITIVA] Instala o FFmpeg, a ferramenta essencial para processamento de áudio.
+# O -y confirma a instalação automaticamente.
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
 # Define o diretório de trabalho dentro do contêiner
 WORKDIR /app
 
