@@ -34,28 +34,20 @@ FFMPEG_OPTIONS = {
     'options': '-vn -nostdin -bufsize 5M',
 }
 
-# Logger agora pega o logger configurado no bot.py
 logger = logging.getLogger('discord_bot.music_cog')
 SPOTIFY_PLAYLIST_REGEX = re.compile(r"https://open.spotify.com/playlist/([a-zA-Z0-9]+)")
-PEER_SIZE = 20  # Quantidade de músicas a carregar por lote
-PEER_THRESHOLD = 5 # Quando a fila chegar a este número, carrega o próximo lote
+PEER_SIZE = 20
+PEER_THRESHOLD = 5
 
 # --- Decorator de Verificação de Ban ---
 def is_not_banned():
-    """
-    Decorator que verifica se o autor de um comando não está banido.
-    Ele é aplicado a todos os comandos de música.
-    """
     async def predicate(ctx_or_interaction: any) -> bool:
-        # Lida tanto com commands.Context quanto com discord.Interaction
         if isinstance(ctx_or_interaction, discord.Interaction):
-            ctx = await ctx_or_interaction.client.get_context(ctx_or_interaction)
             author = ctx_or_interaction.user
             bot = ctx_or_interaction.client
-        else: # É um commands.Context
-            ctx = ctx_or_interaction
-            author = ctx.author
-            bot = ctx.bot
+        else:
+            author = ctx_or_interaction.author
+            bot = ctx_or_interaction.bot
             
         mod_cog = bot.get_cog("Moderation")
         if not mod_cog:
@@ -77,24 +69,21 @@ def is_not_banned():
                     mod_cog._save_bans()
                     return True
             
-            # Responde apropriadamente dependendo do tipo de comando
             if isinstance(ctx_or_interaction, discord.Interaction):
                 await ctx_or_interaction.response.send_message("🚫 Você está proibido de usar os comandos de música.", ephemeral=True)
             else:
-                 await ctx.send("🚫 Você está proibido de usar os comandos de música.")
+                 await ctx_or_interaction.send("🚫 Você está proibido de usar os comandos de música.")
             return False
         
         return True
     
-    # Adapta o check para funcionar tanto com comandos de barra quanto de texto
     return commands.check(predicate)
 
-
-# --- Função de Busca Síncrona ---
+# --- Componentes de Classes ---
 def search_sync(query: str) -> Optional[dict]:
     with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
         try:
-            data = ydl.extract_info(f"ytsearch:{query}", download=False) # Força busca no YT
+            data = ydl.extract_info(f"ytsearch:{query}", download=False)
             if 'entries' in data and data['entries']:
                 return data['entries'][0]
             return None
@@ -103,9 +92,7 @@ def search_sync(query: str) -> Optional[dict]:
             return None
 
 class LoopState(Enum):
-    NONE = 0
-    SONG = 1
-    QUEUE = 2
+    NONE = 0; SONG = 1; QUEUE = 2
 
 class Song:
     def __init__(self, data: dict, requester: discord.Member):
@@ -118,36 +105,27 @@ class Song:
 
 class GuildState:
     def __init__(self, loop: asyncio.AbstractEventLoop, cog_instance: 'MusicCog'):
-        self.cog_instance = cog_instance
-        self.loop = loop
+        self.cog_instance = cog_instance; self.loop = loop
         self.song_queue = asyncio.Queue(maxsize=200)
         self.play_next_song = asyncio.Event()
         self.current_song: Optional[Song] = None
         self.player_task: Optional[asyncio.Task] = None
         self.menu_message: Optional[discord.WebhookMessage] = None
-        self.volume: float = 0.5
-        self.loop_state: LoopState = LoopState.NONE
-        self.song_start_time: Optional[float] = None
-        self.playlist_mode: bool = False
+        self.volume: float = 0.5; self.loop_state: LoopState = LoopState.NONE
+        self.song_start_time: Optional[float] = None; self.playlist_mode: bool = False
         self.playlist_requester: Optional[discord.Member] = None
-        self.playlist_total_tracks: int = 0
-        self.playlist_loaded_tracks: int = 0
-        self.playlist_tracks_to_search: List[str] = []
-        self.playlist_loader_task: Optional[asyncio.Task] = None
+        self.playlist_total_tracks: int = 0; self.playlist_loaded_tracks: int = 0
+        self.playlist_tracks_to_search: List[str] = []; self.playlist_loader_task: Optional[asyncio.Task] = None
 
     def reset_playlist_state(self):
-        self.playlist_mode = False
-        self.playlist_requester = None
-        self.playlist_total_tracks = 0
-        self.playlist_loaded_tracks = 0
+        self.playlist_mode = False; self.playlist_requester = None
+        self.playlist_total_tracks = 0; self.playlist_loaded_tracks = 0
         self.playlist_tracks_to_search.clear()
         if self.playlist_loader_task and not self.playlist_loader_task.done():
             self.playlist_loader_task.cancel()
         while not self.song_queue.empty():
-            try:
-                self.song_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                continue
+            try: self.song_queue.get_nowait()
+            except asyncio.QueueEmpty: continue
         logger.info("Estado da playlist e fila de músicas foram resetados.")
 
     async def update_menu(self):
@@ -160,10 +138,41 @@ class GuildState:
             logger.warning(f"Não foi possível editar a mensagem do menu: {e}")
             self.menu_message = None
 
+# --- Views Interativas ---
+class AdminQueueSelect(ui.Select):
+    def __init__(self, state: GuildState):
+        self.state = state
+        options = [discord.SelectOption(label=f"#{i+1}: {song.title[:80]}", value=str(i)) for i, song in enumerate(list(state.song_queue._queue)[:25])]
+        super().__init__(placeholder="Selecione uma música para tocar em seguida...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        selected_index = int(self.values[0])
+        queue_list = list(self.state.song_queue._queue)
+        song_to_move = queue_list.pop(selected_index)
+        while not self.state.song_queue.empty():
+            try: self.state.song_queue.get_nowait()
+            except asyncio.QueueEmpty: continue
+        await self.state.song_queue.put(song_to_move)
+        for song in queue_list: await self.state.song_queue.put(song)
+        await self.state.update_menu()
+        await interaction.followup.send(f"✅ **{song_to_move.title}** foi movida para o topo da fila.", ephemeral=True, delete_after=10)
+        await interaction.message.delete()
+
+class AdminQueueView(ui.View):
+    def __init__(self, author: discord.Member, state: GuildState):
+        super().__init__(timeout=180)
+        self.author = author; self.add_item(AdminQueueSelect(state))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("Você não pode usar este menu.", ephemeral=True)
+            return False
+        return True
+
 class StopPlaylistView(ui.View):
     def __init__(self, cog: 'MusicCog'):
-        super().__init__(timeout=60)
-        self.cog = cog
+        super().__init__(timeout=60); self.cog = cog
     
     @ui.button(label="Parar Playlist e Limpar Fila", style=discord.ButtonStyle.danger, emoji="⏹️")
     async def stop_playlist(self, interaction: discord.Interaction, button: ui.Button):
@@ -172,27 +181,18 @@ class StopPlaylistView(ui.View):
 
 class PlayerView(ui.View):
     def __init__(self, cog: 'MusicCog', state: GuildState):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.state = state
+        super().__init__(timeout=None); self.cog = cog; self.state = state
         self._update_buttons()
 
     def _update_buttons(self):
         vc = self.state.current_song.requester.guild.voice_client if self.state.current_song else None
-        
         pause_resume_btn = self.children[0]
-        if vc and vc.is_paused():
-            pause_resume_btn.label, pause_resume_btn.emoji, pause_resume_btn.style = "Retomar", "▶️", discord.ButtonStyle.green
-        else:
-            pause_resume_btn.label, pause_resume_btn.emoji, pause_resume_btn.style = "Pausar", "⏸️", discord.ButtonStyle.secondary
-
+        if vc and vc.is_paused(): pause_resume_btn.label, pause_resume_btn.emoji, pause_resume_btn.style = "Retomar", "▶️", discord.ButtonStyle.green
+        else: pause_resume_btn.label, pause_resume_btn.emoji, pause_resume_btn.style = "Pausar", "⏸️", discord.ButtonStyle.secondary
         loop_btn = self.children[3]
-        if self.state.loop_state == LoopState.NONE:
-            loop_btn.label, loop_btn.style = "Loop Off", discord.ButtonStyle.secondary
-        elif self.state.loop_state == LoopState.SONG:
-            loop_btn.label, loop_btn.style = "Loop Msc", discord.ButtonStyle.primary
-        else:
-            loop_btn.label, loop_btn.style = "Loop Fila", discord.ButtonStyle.primary
+        if self.state.loop_state == LoopState.NONE: loop_btn.label, loop_btn.style = "Loop Off", discord.ButtonStyle.secondary
+        elif self.state.loop_state == LoopState.SONG: loop_btn.label, loop_btn.style = "Loop Msc", discord.ButtonStyle.primary
+        else: loop_btn.label, loop_btn.style = "Loop Fila", discord.ButtonStyle.primary
 
     @ui.button(label="Pausar", style=discord.ButtonStyle.secondary, emoji="⏸️", row=0)
     async def pause_resume(self, interaction: discord.Interaction, button: ui.Button):
@@ -225,29 +225,33 @@ class PlayerView(ui.View):
     async def clear_queue(self, interaction: discord.Interaction, button: ui.Button):
         if self.state.song_queue.empty() and not self.state.playlist_tracks_to_search:
             return await interaction.response.send_message("A fila já está vazia.", ephemeral=True)
-        
-        if self.state.playlist_mode:
-            self.state.reset_playlist_state()
+        if self.state.playlist_mode: self.state.reset_playlist_state()
         else:
              while not self.state.song_queue.empty():
                 try: self.state.song_queue.get_nowait()
                 except asyncio.QueueEmpty: continue
-        
         await self.state.update_menu()
         await interaction.response.send_message("🗑️ Fila de músicas limpa!", ephemeral=True)
 
     @ui.button(label="Fila", style=discord.ButtonStyle.primary, emoji="📜", row=1)
     async def queue(self, interaction: discord.Interaction, button: ui.Button):
         await self.cog.show_queue(interaction, ephemeral=True)
+    
+    @ui.button(label="Admin: Pular Fila", style=discord.ButtonStyle.blurple, emoji="🔀", row=2)
+    async def jump_queue(self, interaction: discord.Interaction, button: ui.Button):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message("🚫 Apenas administradores podem usar esta função.", ephemeral=True)
+        if self.state.song_queue.empty():
+            return await interaction.response.send_message("A fila está vazia, não há músicas para reordenar.", ephemeral=True)
+        view = AdminQueueView(interaction.user, self.state)
+        await interaction.response.send_message("Selecione a música para tocar em seguida:", view=view, ephemeral=True)
 
+# --- Classe Principal do Cog de Música ---
 class MusicCog(commands.Cog, name="Music"):
     def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self.guild_states: Dict[int, GuildState] = {}
-        self.process_executor = ProcessPoolExecutor(max_workers=2)
-        self.spotify_client = None
-        client_id = os.getenv("SPOTIPY_CLIENT_ID")
-        client_secret = os.getenv("SPOTIPY_CLIENT_SECRET")
+        self.bot = bot; self.guild_states: Dict[int, GuildState] = {}
+        self.process_executor = ProcessPoolExecutor(max_workers=2); self.spotify_client = None
+        client_id = os.getenv("SPOTIPY_CLIENT_ID"); client_secret = os.getenv("SPOTIPY_CLIENT_SECRET")
         if client_id and client_secret:
             try:
                 auth_manager = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
@@ -256,12 +260,9 @@ class MusicCog(commands.Cog, name="Music"):
             except Exception as e: logger.error(f"Falha ao inicializar o cliente Spotify: {e}")
         else: logger.warning("Credenciais do Spotify não encontradas.")
 
-    def cog_unload(self):
-        self.process_executor.shutdown(wait=True)
-
+    def cog_unload(self): self.process_executor.shutdown(wait=True)
     def get_guild_state(self, guild_id: int) -> GuildState:
-        if guild_id not in self.guild_states:
-            self.guild_states[guild_id] = GuildState(self.bot.loop, self)
+        if guild_id not in self.guild_states: self.guild_states[guild_id] = GuildState(self.bot.loop, self)
         return self.guild_states[guild_id]
 
     async def _cleanup(self, guild: discord.Guild):
@@ -326,7 +327,6 @@ class MusicCog(commands.Cog, name="Music"):
             embed.add_field(name="Duração", value=f"`{m}:{s:02d}`", inline=True)
             embed.add_field(name="Pedido por", value=song.requester.mention, inline=True)
             embed.add_field(name="Volume", value=f"`{int(state.volume * 100)}%`", inline=True)
-            
             queue_text = f"📜 Fila: {state.song_queue.qsize()}"
             if state.playlist_mode: queue_text += f" (+{len(state.playlist_tracks_to_search)} a buscar)"
             queue_text += f" | Loop: {state.loop_state.name.capitalize()}"
@@ -336,64 +336,58 @@ class MusicCog(commands.Cog, name="Music"):
             embed.set_footer(text="Aguardando músicas...")
         return embed
 
-    async def _playlist_peer_loader_loop(self, guild_id: int, requester: discord.Member):
+    async def _playlist_peer_loader_loop(self, guild_id: int, requester: discord.Member, initial_message: discord.Message):
         state = self.get_guild_state(guild_id)
-        logger.info(f"Iniciando carregador de playlist para '{requester.guild.name}'. Total de {state.playlist_total_tracks} músicas.")
+        logger.info(f"Iniciando carregador de playlist para '{requester.guild.name}'.")
         
+        # --- [NOVO] Lógica de Início Rápido ---
+        if state.playlist_tracks_to_search:
+            first_track_query = state.playlist_tracks_to_search.pop(0)
+            await initial_message.edit(content=f"▶️ Tocando a primeira música: `{first_track_query[:50]}...`")
+            first_song = await self._search_song(first_track_query, requester)
+            if first_song:
+                await state.song_queue.put(first_song)
+                state.playlist_loaded_tracks += 1
+                await initial_message.edit(content=f"Tocando `{first_song.title}`. Carregando as outras {len(state.playlist_tracks_to_search)} músicas em segundo plano...")
+            else:
+                await initial_message.edit(content=f"Não achei a primeira música. Tentando a próxima...")
+
+        # --- Carregamento em Lotes (Restante da Playlist) ---
         while state.playlist_tracks_to_search:
             try:
                 if state.song_queue.qsize() <= PEER_THRESHOLD:
                     next_peer_size = min(PEER_SIZE, len(state.playlist_tracks_to_search))
-                    logger.info(f"Fila em {state.song_queue.qsize()} músicas. Carregando próximo lote de {next_peer_size}...")
-
-                    queries_to_search = [state.playlist_tracks_to_search.pop(0) for _ in range(next_peer_size)]
-                    
-                    for query in queries_to_search:
+                    queries = [state.playlist_tracks_to_search.pop(0) for _ in range(next_peer_size)]
+                    for query in queries:
                         song = await self._search_song(query, requester)
-                        if song:
-                            await state.song_queue.put(song)
-                            state.playlist_loaded_tracks += 1
+                        if song: await state.song_queue.put(song); state.playlist_loaded_tracks += 1
                         await asyncio.sleep(0.5)
-                    
-                    logger.info(f"Lote carregado. Fila agora com {state.song_queue.qsize()} músicas.")
                     await state.update_menu()
-                
                 await asyncio.sleep(5)
-            except asyncio.CancelledError:
-                logger.info(f"Carregador de playlist para '{requester.guild.name}' cancelado.")
-                break
-            except Exception as e:
-                logger.error(f"Erro no carregador de playlist para '{requester.guild.name}': {e}", exc_info=e)
-                break
+            except asyncio.CancelledError: logger.info(f"Carregador de playlist para '{requester.guild.name}' cancelado."); break
+            except Exception as e: logger.error(f"Erro no carregador de playlist para '{requester.guild.name}': {e}", exc_info=e); break
         
         state.playlist_mode = False
         logger.info(f"Carregador de playlist para '{requester.guild.name}' concluído.")
 
     # --- COMANDOS ---
     @app_commands.command(name="play", description="Toca uma música do YouTube.")
-    @app_commands.describe(busca="O nome ou URL da música (use !pl para playlists).")
     @is_not_banned()
     async def play(self, interaction: discord.Interaction, busca: str):
         state = self.get_guild_state(interaction.guild_id)
         if state.playlist_mode:
-            embed = discord.Embed(title="Playlist em Andamento", description=f"Uma playlist pedida por **{state.playlist_requester.display_name}** está tocando.\nPara adicionar uma nova música, a playlist atual precisa ser parada.", color=discord.Color.orange())
+            embed = discord.Embed(title="Playlist em Andamento", description=f"Uma playlist pedida por **{state.playlist_requester.display_name}** está tocando.", color=discord.Color.orange())
             return await interaction.response.send_message(embed=embed, view=StopPlaylistView(self), ephemeral=True)
-            
         await interaction.response.defer(ephemeral=True, thinking=True)
         if not interaction.user.voice: return await interaction.followup.send("Você precisa estar em um canal de voz!", ephemeral=True)
         if not interaction.guild.voice_client:
             try: await interaction.user.voice.channel.connect()
             except Exception as e: return await interaction.followup.send(f"Não consegui conectar: {e}", ephemeral=True)
-        
         song = await self._search_song(busca, interaction.user)
         if not song: return await interaction.followup.send(f"Não encontrei a música `{busca}`.", ephemeral=True)
-        
         await state.song_queue.put(song)
         await interaction.followup.send(f"✅ Adicionado à fila: **{song.title}**", ephemeral=True)
-        
-        if not state.player_task or state.player_task.done():
-            state.player_task = self.bot.loop.create_task(self._player_loop(interaction.guild_id))
-        
+        if not state.player_task or state.player_task.done(): state.player_task = self.bot.loop.create_task(self._player_loop(interaction.guild_id))
         if not state.menu_message or not state.menu_message.channel:
             embed = self.build_player_embed(state)
             view = PlayerView(self, state)
@@ -405,40 +399,31 @@ class MusicCog(commands.Cog, name="Music"):
     async def pl(self, ctx: commands.Context, *, url: str = None):
         state = self.get_guild_state(ctx.guild.id)
         if state.playlist_mode:
-            embed = discord.Embed(title="Playlist em Andamento", description=f"Uma playlist pedida por **{state.playlist_requester.display_name}** está tocando.\nPara adicionar uma nova playlist, a atual precisa ser parada.", color=discord.Color.orange())
+            embed = discord.Embed(title="Playlist em Andamento", description=f"Uma playlist pedida por **{state.playlist_requester.display_name}** está tocando.", color=discord.Color.orange())
             return await ctx.send(embed=embed, view=StopPlaylistView(self))
-
         if url is None: return await ctx.send("Uso: `!pl <link da playlist do Spotify>`")
         if not self.spotify_client: return await ctx.send("A integração com o Spotify não está configurada.")
         if not SPOTIFY_PLAYLIST_REGEX.match(url): return await ctx.send("URL de playlist do Spotify inválida.")
         if not ctx.author.voice: return await ctx.send("Você precisa estar em um canal de voz.")
-            
         if not ctx.guild.voice_client:
             try: await ctx.author.voice.channel.connect()
             except Exception as e: return await ctx.send(f"Não consegui conectar: {e}")
-
-        initial_message = await ctx.send(f"🔍 Analisando playlist... Isso pode levar um momento.")
-        
+        initial_message = await ctx.send(f"🔍 Analisando playlist...")
         try:
             items = await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.playlist_tracks(url)['items'])
             if not items: return await initial_message.edit(content="Playlist vazia ou não encontrada.")
-
             state.reset_playlist_state()
             state.playlist_mode = True
             state.playlist_requester = ctx.author
             state.playlist_tracks_to_search = [f"{item['track']['name']} {item['track']['artists'][0]['name']}" for item in items if item.get('track')]
             state.playlist_total_tracks = len(state.playlist_tracks_to_search)
+            if not state.playlist_tracks_to_search: return await initial_message.edit(content="Não extraí músicas válidas da playlist.")
             
-            if not state.playlist_tracks_to_search:
-                return await initial_message.edit(content="Não consegui extrair nenhuma música válida da playlist.")
-
-            await initial_message.edit(content=f"Iniciando playlist com **{state.playlist_total_tracks}** músicas. O carregamento será feito em segundo plano.")
-            
-            state.playlist_loader_task = self.bot.loop.create_task(self._playlist_peer_loader_loop(ctx.guild.id, ctx.author))
-            
+            # Inicia o player loop se não estiver rodando
             if not state.player_task or state.player_task.done():
                 state.player_task = self.bot.loop.create_task(self._player_loop(ctx.guild.id))
-
+            # Inicia o carregador em paralelo
+            state.playlist_loader_task = self.bot.loop.create_task(self._playlist_peer_loader_loop(ctx.guild.id, ctx.author, initial_message))
         except Exception as e:
             logger.error(f"Erro ao processar playlist '{url}': {e}", exc_info=e)
             await initial_message.edit(content="Ocorreu um erro ao buscar a playlist.")
@@ -447,9 +432,7 @@ class MusicCog(commands.Cog, name="Music"):
     @is_not_banned()
     async def status(self, ctx: commands.Context):
         state = self.get_guild_state(ctx.guild.id)
-        if not state.playlist_mode or not state.playlist_requester:
-            return await ctx.send("Nenhuma playlist está em processamento no momento.")
-
+        if not state.playlist_mode or not state.playlist_requester: return await ctx.send("Nenhuma playlist está em processamento.")
         embed = discord.Embed(title="Status da Playlist", color=discord.Color.blue())
         embed.add_field(name="Status", value="Playlist em processamento", inline=False)
         embed.add_field(name="Pedido por", value=state.playlist_requester.mention, inline=False)
@@ -465,8 +448,7 @@ class MusicCog(commands.Cog, name="Music"):
             try:
                 await self.bot.loop.run_in_executor(None, lambda: self.spotify_client.artist('1dfeR4HaWDbWqFHLkxsg1d'))
                 await ctx.send("✅ **Conexão com a API do Spotify bem-sucedida!**")
-            except Exception as e:
-                await ctx.send(f"❌ **Falha ao conectar com a API do Spotify.**\n`Erro: {e}`")
+            except Exception as e: await ctx.send(f"❌ **Falha ao conectar com a API do Spotify.**\n`Erro: {e}`")
 
     @app_commands.command(name="nowplaying", description="Mostra informações da música que está tocando.")
     @is_not_banned()
@@ -474,18 +456,13 @@ class MusicCog(commands.Cog, name="Music"):
         state = self.get_guild_state(interaction.guild_id)
         if not state.current_song or not state.song_start_time:
             return await interaction.response.send_message("Não há nenhuma música tocando.", ephemeral=True)
-        
-        song = state.current_song
-        elapsed = time.time() - state.song_start_time
-        
+        song = state.current_song; elapsed = time.time() - state.song_start_time
         progress_bar_length = 20
         progress_percent = min(elapsed / song.duration, 1.0) if song.duration > 0 else 0
         filled_blocks = int(progress_percent * progress_bar_length)
         progress_bar = '▬' * filled_blocks + '🔵' + '▬' * (progress_bar_length - 1 - filled_blocks) if filled_blocks < progress_bar_length else '▬' * progress_bar_length
-
         m_elapsed, s_elapsed = divmod(int(elapsed), 60)
         m_total, s_total = divmod(song.duration, 60)
-        
         embed = discord.Embed(title="Tocando Agora", color=discord.Color.green(), description=f"**[{song.title}]({song.webpage_url})**")
         embed.set_thumbnail(url=song.thumbnail)
         embed.add_field(name="Progresso", value=f"`{progress_bar}`\n`{m_elapsed:02d}:{s_elapsed:02d} / {m_total:02d}:{s_total:02d}`", inline=False)
@@ -496,21 +473,17 @@ class MusicCog(commands.Cog, name="Music"):
         state = self.get_guild_state(interaction.guild.id)
         if state.song_queue.empty() and not state.current_song and not state.playlist_tracks_to_search:
             return await interaction.response.send_message("A fila está vazia!", ephemeral=ephemeral)
-        
         embed = discord.Embed(title="📜 Fila de Músicas", color=discord.Color.orange())
         desc = ""
         if state.current_song: desc += f"**Tocando Agora:**\n`▶️` {state.current_song.title}\n\n"
-        
         desc += "**Próximas na fila:**\n"
         queue_list = list(state.song_queue._queue)
         if not queue_list: desc += "Nenhuma música na fila.\n"
         else:
             lines = [f"`{i+1}.` {song.title}" for i, song in enumerate(queue_list[:10])]
             desc += "\n".join(lines)
-        
         if state.playlist_mode:
             desc += f"\n\n**Aguardando busca:**\n`+{len(state.playlist_tracks_to_search)}` músicas da playlist."
-        
         embed.description = desc
         if len(queue_list) > 10: embed.set_footer(text=f"... e mais {len(queue_list) - 10} música(s).")
         await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
